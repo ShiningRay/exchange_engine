@@ -1,0 +1,215 @@
+#!/usr/bin/env ruby
+
+require 'bundler/setup'
+require 'sinatra'
+require 'connection_pool'
+require 'redis'
+require 'json'
+require 'logger'
+require 'yaml'
+require_relative '../lib/order_book'
+
+# 配置日志
+def setup_logger
+  logger = Logger.new(STDOUT)
+  logger.level = ENV['LOG_LEVEL'] || Logger::INFO
+  logger.formatter = proc do |severity, datetime, progname, msg|
+    "[#{datetime}] #{severity} [#{Thread.current.object_id}] - #{msg}\n"
+  end
+  logger
+end
+
+LOGGER = setup_logger
+
+# 加载配置
+def load_config
+  env = ENV['RACK_ENV'] || 'development'
+  LOGGER.info("Loading configuration for environment: #{env}")
+  
+  config_file = File.join(File.dirname(__FILE__), '..', 'config', 'config.yml')
+  if File.exist?(config_file)
+    YAML.load_file(config_file)[env]
+  else
+    LOGGER.warn("Configuration file not found, using defaults")
+    {
+      'redis_url' => 'redis://localhost:6379/0',
+      'port' => 3000,
+      'trading_pairs' => ['BTCUSDT', 'ETHUSDT'],
+      'log_level' => 'info'
+    }
+  end
+end
+
+CONFIG = load_config
+
+# 配置Sinatra
+set :port, CONFIG['port']
+set :bind, '0.0.0.0'
+LOGGER.info("Server configured to run on port #{CONFIG['port']}")
+
+# 初始化Redis连接池
+REDIS_POOL = ConnectionPool.new(size: 5) do
+  LOGGER.info("Initializing Redis connection to #{CONFIG['redis_url']}")
+  Redis.new(url: CONFIG['redis_url'])
+end
+
+# 初始化交易对
+TRADING_PAIRS = CONFIG['trading_pairs']
+ORDER_BOOKS = {}
+
+TRADING_PAIRS.each do |pair|
+  LOGGER.info("Initializing order book for #{pair}")
+  ORDER_BOOKS[pair] = ExchangeEngine::OrderBook.new(pair, REDIS_POOL, LOGGER)
+end
+
+# 错误处理
+error do
+  err = env['sinatra.error']
+  LOGGER.error("Unexpected error: #{err.message}")
+  LOGGER.error(err.backtrace.join("\n"))
+  status 500
+  { error: 'Internal Server Error', message: err.message }.to_json
+end
+
+# 健康检查
+get '/health' do
+  content_type :json
+  LOGGER.debug("Health check requested")
+  { 
+    status: 'ok', 
+    timestamp: Time.now.to_i,
+    trading_pairs: TRADING_PAIRS,
+    redis_connected: test_redis_connection
+  }.to_json
+end
+
+# 添加限价订单
+post '/api/v1/orders' do
+  content_type :json
+  LOGGER.info("Received order creation request")
+  
+  begin
+    payload = JSON.parse(request.body.read, symbolize_names: true)
+    LOGGER.debug("Order payload: #{payload.inspect}")
+    
+    # 参数验证
+    required_params = [:trading_pair, :side, :price, :amount]
+    missing_params = required_params.select { |p| !payload[p] }
+    
+    if !missing_params.empty?
+      LOGGER.warn("Missing parameters: #{missing_params.join(', ')}")
+      status 400
+      return { error: "Missing required parameters: #{missing_params.join(', ')}" }.to_json
+    end
+    
+    if !TRADING_PAIRS.include?(payload[:trading_pair])
+      LOGGER.warn("Invalid trading pair: #{payload[:trading_pair]}")
+      status 400
+      return { error: "Invalid trading pair. Supported pairs: #{TRADING_PAIRS.join(', ')}" }.to_json
+    end
+    
+    order = {
+      id: "order_#{Time.now.to_i}_#{SecureRandom.hex(4)}",
+      trading_pair: payload[:trading_pair],
+      side: payload[:side],
+      price: payload[:price].to_f,
+      amount: payload[:amount].to_f,
+      timestamp: Time.now.to_i
+    }
+    
+    LOGGER.info("Creating order: #{order[:id]}")
+    order_book = ORDER_BOOKS[payload[:trading_pair]]
+    order_book.add_limit_order(order)
+    
+    LOGGER.info("Order #{order[:id]} created successfully")
+    status 201
+    { order_id: order[:id] }.to_json
+  rescue JSON::ParserError => e
+    LOGGER.error("Invalid JSON in request: #{e.message}")
+    status 400
+    { error: 'Invalid JSON format' }.to_json
+  rescue => e
+    LOGGER.error("Error creating order: #{e.message}")
+    LOGGER.error(e.backtrace.join("\n"))
+    status 500
+    { error: e.message }.to_json
+  end
+end
+
+# 取消订单
+delete '/api/v1/orders/:order_id' do |order_id|
+  content_type :json
+  LOGGER.info("Received cancellation request for order: #{order_id}")
+  
+  trading_pair = params[:trading_pair]
+  
+  if !trading_pair || !TRADING_PAIRS.include?(trading_pair)
+    LOGGER.warn("Invalid trading pair: #{trading_pair}")
+    status 400
+    return { error: "Invalid or missing trading pair parameter" }.to_json
+  end
+  
+  begin
+    order_book = ORDER_BOOKS[trading_pair]
+    if order_book.cancel_order(order_id)
+      LOGGER.info("Order #{order_id} cancelled successfully")
+      status 200
+      { status: 'success', order_id: order_id }.to_json
+    else
+      LOGGER.warn("Order #{order_id} not found")
+      status 404
+      { error: 'Order not found' }.to_json
+    end
+  rescue => e
+    LOGGER.error("Error cancelling order #{order_id}: #{e.message}")
+    LOGGER.error(e.backtrace.join("\n"))
+    status 500
+    { error: e.message }.to_json
+  end
+end
+
+# 查询订单状态
+get '/api/v1/orders/:order_id' do |order_id|
+  content_type :json
+  LOGGER.info("Received status request for order: #{order_id}")
+  
+  trading_pair = params[:trading_pair]
+  
+  if !trading_pair || !TRADING_PAIRS.include?(trading_pair)
+    LOGGER.warn("Invalid trading pair: #{trading_pair}")
+    status 400
+    return { error: "Invalid or missing trading pair parameter" }.to_json
+  end
+  
+  begin
+    REDIS_POOL.with do |conn|
+      order = conn.hgetall("order:#{trading_pair}:#{order_id}")
+      if order.empty?
+        LOGGER.warn("Order #{order_id} not found")
+        status 404
+        { error: 'Order not found' }.to_json
+      else
+        LOGGER.info("Order #{order_id} found: #{order.inspect}")
+        status 200
+        order.to_json
+      end
+    end
+  rescue => e
+    LOGGER.error("Error querying order #{order_id}: #{e.message}")
+    LOGGER.error(e.backtrace.join("\n"))
+    status 500
+    { error: e.message }.to_json
+  end
+end
+
+def test_redis_connection
+  REDIS_POOL.with do |conn|
+    conn.ping == 'PONG'
+  end
+rescue => e
+  LOGGER.error("Redis connection test failed: #{e.message}")
+  false
+end
+
+LOGGER.info("Exchange Engine starting on port #{settings.port}...")
+LOGGER.info("Supported trading pairs: #{TRADING_PAIRS.join(', ')}")

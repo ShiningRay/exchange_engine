@@ -1,0 +1,23 @@
+development:
+  redis_url: 'redis://localhost:6379/0'
+  port: 3000
+  trading_pairs:
+    - 'BTCUSDT'
+    - 'ETHUSDT'
+  log_level: 'debug'
+
+test:
+  redis_url: 'redis://localhost:6379/1'
+  port: 3001
+  trading_pairs:
+    - 'BTCUSDT'
+    - 'ETHUSDT'
+  log_level: 'info'
+
+production:
+  redis_url: <%= ENV['REDIS_URL'] %>
+  port: <%= ENV['PORT'] || 3000 %>
+  trading_pairs:
+    - 'BTCUSDT'
+    - 'ETHUSDT'
+  log_level: 'warn'
