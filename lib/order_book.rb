@@ -53,6 +53,48 @@ module ExchangeEngine
       match_orders
     end
 
+    # 添加市价单
+    def add_market_order(order)
+      @logger.info("Adding market #{order['side']} order: #{order.inspect}")
+      amount = BigDecimal(order['amount'].to_s)
+      
+      @redis.with do |conn|
+        order_key = order_key(order['id'])
+        
+        # 获取对手方最优价格订单
+        counter_side = order['side'] == 'buy' ? 'sell' : 'buy'
+        best_price = order['side'] == 'buy' ? get_best_ask(conn) : get_best_bid(conn)
+        
+        if best_price.nil?
+          @logger.warn("No matching orders available for market order #{order['id']}")
+          conn.hset(order_key,
+            'id', order['id'],
+            'amount', amount.to_s('F'),
+            'side', order['side'],
+            'status', 'failed',
+            'error', 'No matching orders available',
+            'timestamp', Time.now.to_i,
+            'type', 'market'
+          )
+          return false
+        end
+
+        # 保存订单信息
+        conn.hset(order_key,
+          'id', order['id'],
+          'amount', amount.to_s('F'),
+          'side', order['side'],
+          'status', 'open',
+          'timestamp', Time.now.to_i,
+          'type', 'market'
+        )
+        
+        # 立即尝试撮合
+        execute_market_order(conn, order['id'], amount, order['side'])
+      end
+      true
+    end
+
     # 取消订单
     def cancel_order(order_id)
       @logger.info("Attempting to cancel order: #{order_id}")
@@ -192,6 +234,47 @@ module ExchangeEngine
       execute_trade(conn, bid_order, ask_order, trade_amount.to_s('F'), ask_price)
 
       true
+    end
+
+    def execute_market_order(conn, order_id, remaining_amount, side)
+      while remaining_amount > 0
+        # 获取对手方最优价格订单
+        best_price = side == 'buy' ? get_best_ask(conn) : get_best_bid(conn)
+        break if best_price.nil?
+
+        # 获取该价格的所有订单
+        counter_side = side == 'buy' ? 'sell' : 'buy'
+        orders = conn.zrangebyscore(price_key(counter_side), best_price, best_price)
+        break if orders.empty?
+
+        # 遍历订单进行撮合
+        orders.each do |counter_order_id|
+          counter_order = conn.hgetall(order_key(counter_order_id))
+          next if counter_order.empty? || counter_order['status'] != 'open'
+
+          counter_amount = BigDecimal(counter_order['amount'])
+          trade_amount = [remaining_amount, counter_amount].min
+          
+          # 执行交易
+          execute_trade(conn, 
+            side == 'buy' ? {'id' => order_id, 'side' => 'buy'} : counter_order,
+            side == 'buy' ? counter_order : {'id' => order_id, 'side' => 'sell'},
+            trade_amount.to_s('F'),
+            best_price
+          )
+
+          remaining_amount -= trade_amount
+          break if remaining_amount <= 0
+        end
+      end
+
+      # 如果还有剩余数量，更新订单状态为部分成交
+      if remaining_amount > 0
+        conn.hset(order_key(order_id), 
+          'status', 'partially_filled',
+          'remaining_amount', remaining_amount.to_s('F')
+        )
+      end
     end
 
     def update_order_after_trade(multi, order, traded_amount)

@@ -90,57 +90,91 @@ module ExchangeEngine
             return
           end
 
+          # 验证订单类型
+          unless ['limit', 'market'].include?(order['type'])
+            error_msg = "Invalid order type: #{order['type']}"
+            @logger.error(error_msg)
+            conn.lpush(failed_queue_name, Oj.dump({
+              'order' => order,
+              'error' => error_msg,
+              'timestamp' => Time.now.to_i
+            }))
+            return
+          end
+
+          # 验证市价单
+          if order['type'] == 'market' && !order['amount']
+            error_msg = "Market order must specify amount"
+            @logger.error(error_msg)
+            conn.lpush(failed_queue_name, Oj.dump({
+              'order' => order,
+              'error' => error_msg,
+              'timestamp' => Time.now.to_i
+            }))
+            return
+          end
+
+          # 验证限价单
+          if order['type'] == 'limit' && (!order['price'] || !order['amount'])
+            error_msg = "Limit order must specify both price and amount"
+            @logger.error(error_msg)
+            conn.lpush(failed_queue_name, Oj.dump({
+              'order' => order,
+              'error' => error_msg,
+              'timestamp' => Time.now.to_i
+            }))
+            return
+          end
+
           # 转换订单格式，使用 BigDecimal
           processed_order = {
             'id' => order['id'],
             'side' => order['side'],
-            'price' => BigDecimal(order['price'].to_s).to_s('F'),
             'amount' => BigDecimal(order['amount'].to_s).to_s('F'),
             'timestamp' => order['timestamp'] || Time.now.to_i,
             'type' => order['type'],
             'trading_pair' => order['trading_pair']
           }
+          
+          # 对于限价单，添加价格字段
+          if order['type'] == 'limit'
+            processed_order['price'] = BigDecimal(order['price'].to_s).to_s('F')
+          end
 
           # 验证价格和数量
-          price = BigDecimal(processed_order['price'])
-          amount = BigDecimal(processed_order['amount'])
+          if order['type'] == 'limit'
+            price = BigDecimal(processed_order['price'])
+            amount = BigDecimal(processed_order['amount'])
 
-          if price.negative? || price.zero?
-            error_msg = "Invalid price: #{price}"
-            @logger.error(error_msg)
-            conn.lpush(failed_queue_name, Oj.dump({
-              'order' => order,
-              'error' => error_msg,
-              'timestamp' => Time.now.to_i
-            }))
-            return
+            if price.negative? || price.zero?
+              error_msg = "Invalid price: #{price}"
+              @logger.error(error_msg)
+              conn.lpush(failed_queue_name, Oj.dump({
+                'order' => order,
+                'error' => error_msg,
+                'timestamp' => Time.now.to_i
+              }))
+              return
+            end
+
+            if amount.negative? || amount.zero?
+              error_msg = "Invalid amount: #{amount}"
+              @logger.error(error_msg)
+              conn.lpush(failed_queue_name, Oj.dump({
+                'order' => order,
+                'error' => error_msg,
+                'timestamp' => Time.now.to_i
+              }))
+              return
+            end
           end
 
-          if amount.negative? || amount.zero?
-            error_msg = "Invalid amount: #{amount}"
-            @logger.error(error_msg)
-            conn.lpush(failed_queue_name, Oj.dump({
-              'order' => order,
-              'error' => error_msg,
-              'timestamp' => Time.now.to_i
-            }))
-            return
-          end
-
-          # 处理订单
+          # 根据订单类型处理
           case order['type']
           when 'limit'
             @order_book.add_limit_order(processed_order)
-          when 'cancel'
-            @order_book.cancel_order(processed_order['id'])
-          else
-            error_msg = "Unknown order type: #{order['type']}"
-            @logger.error(error_msg)
-            conn.lpush(failed_queue_name, Oj.dump({
-              'order' => order,
-              'error' => error_msg,
-              'timestamp' => Time.now.to_i
-            }))
+          when 'market'
+            @order_book.add_market_order(processed_order)
           end
 
         rescue => e
