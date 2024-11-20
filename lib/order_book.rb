@@ -141,24 +141,24 @@ module ExchangeEngine
       trade = {
         'id' => trade_id,
         'price' => BigDecimal(price.to_s).to_s('F'),
-        'amount' => BigDecimal(amount.to_s).to_s('F'),
+        'amount' => amount,
         'bid_order_id' => bid_order['id'],
         'ask_order_id' => ask_order['id'],
-        'timestamp' => Time.now.to_i,
-        'trading_pair' => @symbol
+        'timestamp' => Time.now.to_i
       }
 
       conn.multi do |multi|
+        # 更新买单状态
+        update_order_after_trade(multi, bid_order, amount) if bid_order['type'] == 'limit'
+        
+        # 更新卖单状态
+        update_order_after_trade(multi, ask_order, amount) if ask_order['type'] == 'limit'
+        
         # 记录成交
-        multi.rpush(trades_key, Oj.dump(trade))
-        multi.ltrim(trades_key, -1000, -1)  # 保留最近1000条成交记录
-
-        # 更新订单状态
-        update_order_after_trade(multi, bid_order, amount)
-        update_order_after_trade(multi, ask_order, amount)
+        multi.lpush(trades_key, Oj.dump(trade))
       end
-
-      @logger.info("Trade #{trade_id} executed successfully")
+      
+      @logger.info("Trade executed: #{trade.inspect}")
       trade
     end
 
@@ -170,12 +170,30 @@ module ExchangeEngine
       end
     end
 
-    # 打印最近的成交记录
     def print_recent_trades(limit = 50)
       trades = recent_trades(limit)
       @logger.info("Recent Trades for #{@symbol}:")
       trades.each do |trade|
         @logger.info("#{trade['timestamp']} - Price: #{trade['price']}, Amount: #{trade['amount']}")
+      end
+    end
+
+    # 获取市场深度数据
+    def get_market_depth(levels = 20)
+      @logger.info("Calculating market depth for #{@symbol}, levels: #{levels}")
+      
+      @redis.with do |conn|
+        # 获取买单深度
+        bids = calculate_depth(conn, 'buy', levels)
+        
+        # 获取卖单深度
+        asks = calculate_depth(conn, 'sell', levels)
+        
+        {
+          'bids' => bids,
+          'asks' => asks,
+          'timestamp' => Time.now.to_i
+        }
       end
     end
 
@@ -237,6 +255,10 @@ module ExchangeEngine
     end
 
     def execute_market_order(conn, order_id, remaining_amount, side)
+      original_amount = remaining_amount
+      trades = []
+      total_executed = BigDecimal('0')
+      
       while remaining_amount > 0
         # 获取对手方最优价格订单
         best_price = side == 'buy' ? get_best_ask(conn) : get_best_bid(conn)
@@ -248,6 +270,7 @@ module ExchangeEngine
         break if orders.empty?
 
         # 遍历订单进行撮合
+        price_level_amount = BigDecimal('0')
         orders.each do |counter_order_id|
           counter_order = conn.hgetall(order_key(counter_order_id))
           next if counter_order.empty? || counter_order['status'] != 'open'
@@ -256,40 +279,88 @@ module ExchangeEngine
           trade_amount = [remaining_amount, counter_amount].min
           
           # 执行交易
-          execute_trade(conn, 
-            side == 'buy' ? {'id' => order_id, 'side' => 'buy'} : counter_order,
-            side == 'buy' ? counter_order : {'id' => order_id, 'side' => 'sell'},
-            trade_amount.to_s('F'),
-            best_price
-          )
+          # 记录交易
+          trade = {
+            'id' => "trade:#{Time.now.to_i}:#{SecureRandom.hex(4)}",
+            'price' => best_price,
+            'amount' => trade_amount.to_s('F'),
+            'bid_order_id' => side == 'buy' ? order_id : counter_order['id'],
+            'ask_order_id' => side == 'buy' ? counter_order['id'] : order_id,
+            'timestamp' => Time.now.to_i
+          }
+          conn.lpush(trades_key, Oj.dump(trade))
 
-          remaining_amount -= trade_amount
-          break if remaining_amount <= 0
+          # 更新对手方订单
+          update_order_after_trade(conn, counter_order, trade_amount)
+          
+          if trade
+            trades << trade
+            total_executed += trade_amount
+            remaining_amount -= trade_amount
+            price_level_amount += trade_amount
+
+            # 更新订单状态
+            if remaining_amount > 0
+              conn.hset(order_key(order_id), 
+                'status', 'partially_filled',
+                'remaining_amount', remaining_amount.to_s('F')
+              )
+            else
+              conn.hset(order_key(order_id), 
+                'status', 'filled',
+                'remaining_amount', '0'
+              )
+              break
+            end
+          end
         end
+
+        # 如果当前价格档位已经用完，继续下一个价格档位
+        break if remaining_amount <= 0
       end
 
-      # 如果还有剩余数量，更新订单状态为部分成交
-      if remaining_amount > 0
+      # 更新市价单最终状态
+      if total_executed == 0
+        conn.hset(order_key(order_id), 
+          'status', 'failed',
+          'error', 'No matching orders available'
+        )
+        return false
+      elsif total_executed < original_amount
         conn.hset(order_key(order_id), 
           'status', 'partially_filled',
           'remaining_amount', remaining_amount.to_s('F')
         )
+      else
+        conn.hset(order_key(order_id), 
+          'status', 'filled',
+          'remaining_amount', '0'
+        )
       end
+
+      true
     end
 
     def update_order_after_trade(multi, order, traded_amount)
       order_key = order_key(order['id'])
       price_key = price_key(order['side'])
       
-      remaining_amount = BigDecimal(order['amount']) - BigDecimal(traded_amount.to_s)
-      
-      if remaining_amount.zero?
+      # 获取订单当前数量
+      current_amount = BigDecimal(order['amount'])
+      traded = BigDecimal(traded_amount.to_s)
+      remaining_amount = current_amount - traded
+
+      if remaining_amount <= 0
         # 订单完全成交，从价格队列中移除
         multi.zrem(price_key, order['id'])
-        multi.hset(order_key, 'status', 'filled')
+        multi.hset(order_key, 'status', 'filled', 'remaining_amount', '0')
       else
         # 订单部分成交，更新剩余数量
-        multi.hset(order_key, 'amount', remaining_amount.to_s('F'))
+        multi.hset(order_key, 
+          'amount', remaining_amount.to_s('F'),
+          'status', 'partially_filled',
+          'remaining_amount', remaining_amount.to_s('F')
+        )
       end
     end
 
@@ -310,6 +381,74 @@ module ExchangeEngine
       orders.each do |order|
         @logger.info("#{order['id']} - Price: #{order['price']}, Amount: #{order['amount']}")
       end
+    end
+
+    def calculate_depth(conn, side, levels)
+      price_key = price_key(side)
+      depth = []
+      total_volume = BigDecimal('0')
+      
+      # 获取排序后的价格和订单ID
+      orders = if side == 'buy'
+        # 买单按价格降序排列
+        conn.zrevrange(price_key, 0, levels - 1, with_scores: true)
+      else
+        # 卖单按价格升序排列
+        conn.zrange(price_key, 0, levels - 1, with_scores: true)
+      end
+
+      # 按价格分组计算数量
+      current_price = nil
+      current_amount = BigDecimal('0')
+      
+      orders.each do |order_id, price|
+        order = conn.hgetall(order_key(order_id))
+        next if order.empty? || order['status'] != 'open'
+        
+        price = BigDecimal(price.to_s)
+        amount = BigDecimal(order['amount'].to_s)
+        
+        if current_price != price && !current_price.nil?
+          # 添加当前价格层级的深度数据
+          total_volume += current_amount
+          depth << {
+            'price' => current_price.to_s('F'),
+            'amount' => current_amount.to_s('F'),
+            'total' => total_volume.to_s('F')
+          }
+          current_amount = BigDecimal('0')
+        end
+        
+        current_price = price
+        current_amount += amount
+      end
+      
+      # 添加最后一个价格层级
+      if current_price && current_amount > 0
+        total_volume += current_amount
+        depth << {
+          'price' => current_price.to_s('F'),
+          'amount' => current_amount.to_s('F'),
+          'total' => total_volume.to_s('F')
+        }
+      end
+      
+      depth
+    end
+
+    # 获取指定价格的订单总量
+    def get_volume_at_price(conn, side, price)
+      price_str = BigDecimal(price.to_s).to_s('F')
+      orders = conn.zrangebyscore(price_key(side), price_str, price_str)
+      
+      total_volume = BigDecimal('0')
+      orders.each do |order_id|
+        order = conn.hgetall(order_key(order_id))
+        next if order.empty? || order['status'] != 'open'
+        total_volume += BigDecimal(order['amount'].to_s)
+      end
+      
+      total_volume
     end
 
     def order_key(order_id)

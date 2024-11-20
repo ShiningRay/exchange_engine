@@ -1,6 +1,8 @@
 require 'rspec'
 require 'mock_redis'
 require 'connection_pool'
+require 'pry'
+require 'pry-byebug'
 
 # 这里我们使用 mock_redis 来模拟 Redis 服务器
 RSpec.configure do |config|

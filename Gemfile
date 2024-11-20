@@ -12,4 +12,6 @@ group :development, :test do
   gem 'rspec', '~> 3.12'        # 测试框架
   gem 'mock_redis', '~> 0.34'   # Redis测试模拟
   gem 'rack-test', '~> 2.1'     # HTTP测试工具
+  gem 'pry', '~> 0.14'          # 调试工具
+  gem 'pry-byebug', '~> 3.10'   # Pry的调试增强
 end
