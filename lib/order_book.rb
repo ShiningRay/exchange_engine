@@ -3,6 +3,7 @@ require 'connection_pool'
 require 'oj'
 require 'logger'
 require 'securerandom'
+require 'bigdecimal'
 
 module ExchangeEngine
   class OrderBook
@@ -21,28 +22,32 @@ module ExchangeEngine
 
     # 添加限价订单
     def add_limit_order(order)
-      @logger.info("Adding #{order[:side]} order: #{order.inspect}")
+      @logger.info("Adding #{order['side']} order: #{order.inspect}")
       @redis.with do |conn|
-        order_key = order_key(order[:id])
-        price_key = price_key(order[:side])
+        order_key = order_key(order['id'])
+        price_key = price_key(order['side'])
+        
+        # 将 BigDecimal 转换为字符串
+        price = BigDecimal(order['price'].to_s).to_s('F')
+        amount = BigDecimal(order['amount'].to_s).to_s('F')
         
         conn.multi do |multi|
           # 保存订单详情
           multi.hset(order_key, 
-            'id', order[:id],
-            'price', order[:price].to_f,
-            'amount', order[:amount].to_f,
-            'side', order[:side],
+            'id', order['id'],
+            'price', price,
+            'amount', amount,
+            'side', order['side'],
             'status', 'open',
             'timestamp', Time.now.to_i
           )
           
-          # 将订单添加到价格队列
-          multi.zadd(price_key, order[:price], order[:id])
+          # 将订单添加到价格队列，使用字符串形式的价格
+          multi.zadd(price_key, price, order['id'])
         end
       end
       
-      @logger.debug("Order #{order[:id]} added to Redis")
+      @logger.debug("Order #{order['id']} added to Redis")
       
       # 尝试撮合订单
       match_orders
@@ -93,8 +98,8 @@ module ExchangeEngine
       
       trade = {
         'id' => trade_id,
-        'price' => price,
-        'amount' => amount,
+        'price' => BigDecimal(price.to_s).to_s('F'),
+        'amount' => BigDecimal(amount.to_s).to_s('F'),
         'bid_order_id' => bid_order['id'],
         'ask_order_id' => ask_order['id'],
         'timestamp' => Time.now.to_i,
@@ -102,195 +107,125 @@ module ExchangeEngine
       }
 
       conn.multi do |multi|
-        # 更新买方订单
+        # 记录成交
+        multi.rpush(trades_key, Oj.dump(trade))
+        multi.ltrim(trades_key, -1000, -1)  # 保留最近1000条成交记录
+
+        # 更新订单状态
         update_order_after_trade(multi, bid_order, amount)
-        
-        # 更新卖方订单
         update_order_after_trade(multi, ask_order, amount)
-
-        # 记录成交到交易队列
-        multi.lpush(trades_key, Oj.dump(trade))
-        # 限制队列长度，保留最近的 1000 条记录
-        multi.ltrim(trades_key, 0, 999)
-
-        # 同时保存交易详情
-        multi.hmset("#{@symbol}:#{trade_id}",
-          'id', trade_id,
-          'price', price,
-          'amount', amount,
-          'bid_order_id', bid_order['id'],
-          'ask_order_id', ask_order['id'],
-          'timestamp', trade['timestamp']
-        )
       end
-      
+
       @logger.info("Trade #{trade_id} executed successfully")
+      trade
     end
 
     # 获取最近的成交记录
     def recent_trades(limit = 50)
-      @logger.debug("Fetching recent trades, limit: #{limit}")
-      trades = []
-      
       @redis.with do |conn|
-        raw_trades = conn.lrange(trades_key, 0, limit - 1)
-        trades = raw_trades.map { |t| Oj.load(t) }
+        trades = conn.lrange(trades_key, -limit, -1)
+        trades.map { |t| Oj.load(t) }
       end
-
-      @logger.debug("Found #{trades.size} recent trades")
-      trades
     end
 
     # 打印最近的成交记录
     def print_recent_trades(limit = 50)
-      @logger.info("Recent Trades for #{@symbol}")
       trades = recent_trades(limit)
-      
-      if trades.empty?
-        @logger.info("  No trades found")
-        return
-      end
-
+      @logger.info("Recent Trades for #{@symbol}:")
       trades.each do |trade|
-        @logger.info("  Trade ID: #{trade['id']}")
-        @logger.info("    Price: #{trade['price']}")
-        @logger.info("    Amount: #{trade['amount']}")
-        @logger.info("    Time: #{Time.at(trade['timestamp'])}")
-        @logger.info("    Bid Order: #{trade['bid_order_id']}")
-        @logger.info("    Ask Order: #{trade['ask_order_id']}")
-        @logger.info("    ---------------")
+        @logger.info("#{trade['timestamp']} - Price: #{trade['price']}, Amount: #{trade['amount']}")
       end
     end
 
     private
 
     def match_orders
-      @logger.debug("Starting order matching process")
       @redis.with do |conn|
         loop do
-          # 获取最高买价和最低卖价
-          highest_bid = get_best_bid(conn)
-          lowest_ask = get_best_ask(conn)
+          # 获取最优买卖价格
+          bid_price = get_best_bid(conn)
+          ask_price = get_best_ask(conn)
 
-          @logger.debug("Best bid: #{highest_bid}, Best ask: #{lowest_ask}")
+          break if bid_price.nil? || ask_price.nil?
+          bid_price = BigDecimal(bid_price.to_s)
+          ask_price = BigDecimal(ask_price.to_s)
 
-          # 如果没有可以撮合的订单，退出循环
-          if highest_bid.nil? || lowest_ask.nil?
-            @logger.debug("No matching possible - missing orders")
-            break
-          end
-
-          if highest_bid < lowest_ask
-            @logger.debug("No matching possible - bid #{highest_bid} < ask #{lowest_ask}")
-            break
-          end
+          # 如果买价小于卖价，无法撮合
+          break if bid_price < ask_price
 
           # 执行撮合
-          execute_match(conn, highest_bid, lowest_ask)
+          executed = execute_match(conn, bid_price.to_s('F'), ask_price.to_s('F'))
+          break unless executed
         end
       end
-      @logger.debug("Order matching process completed")
     end
 
     def get_best_bid(conn)
-      bid_orders = conn.zrevrange(price_key('buy'), 0, 0, with_scores: true)
-      result = bid_orders.empty? ? nil : bid_orders[0][1]
-      @logger.debug("Best bid price: #{result}")
-      result
+      # 获取买方最高价格
+      result = conn.zrevrange(price_key('buy'), 0, 0, with_scores: true)
+      result.empty? ? nil : result[0][1].to_s
     end
 
     def get_best_ask(conn)
-      ask_orders = conn.zrange(price_key('sell'), 0, 0, with_scores: true)
-      result = ask_orders.empty? ? nil : ask_orders[0][1]
-      @logger.debug("Best ask price: #{result}")
-      result
+      # 获取卖方最低价格
+      result = conn.zrange(price_key('sell'), 0, 0, with_scores: true)
+      result.empty? ? nil : result[0][1].to_s
     end
 
     def execute_match(conn, bid_price, ask_price)
-      @logger.info("Executing match - Bid: #{bid_price}, Ask: #{ask_price}")
-      
-      # 获取这个价格级别的订单
+      # 获取对应价格的订单
       bid_orders = conn.zrangebyscore(price_key('buy'), bid_price, bid_price)
       ask_orders = conn.zrangebyscore(price_key('sell'), ask_price, ask_price)
 
-      if bid_orders.empty? || ask_orders.empty?
-        @logger.warn("No orders found at price levels - Bid orders: #{bid_orders.size}, Ask orders: #{ask_orders.size}")
-        return
-      end
+      return false if bid_orders.empty? || ask_orders.empty?
 
+      # 获取订单详情
       bid_order = conn.hgetall(order_key(bid_orders[0]))
       ask_order = conn.hgetall(order_key(ask_orders[0]))
 
-      if bid_order.empty? || ask_order.empty?
-        @logger.warn("Order details not found - Bid: #{bid_orders[0]}, Ask: #{ask_orders[0]}")
-        return
-      end
-
-      # 计算成交量
-      match_amount = [bid_order['amount'].to_f, ask_order['amount'].to_f].min
-      match_price = ask_price  # 通常采用卖方价格
-
-      @logger.info("Match found - Amount: #{match_amount}, Price: #{match_price}")
-      @logger.debug("Bid order: #{bid_order.inspect}")
-      @logger.debug("Ask order: #{ask_order.inspect}")
+      # 计算成交数量
+      bid_amount = BigDecimal(bid_order['amount'])
+      ask_amount = BigDecimal(ask_order['amount'])
+      trade_amount = [bid_amount, ask_amount].min
 
       # 执行成交
-      execute_trade(conn, bid_order, ask_order, match_amount, match_price)
+      execute_trade(conn, bid_order, ask_order, trade_amount.to_s('F'), ask_price)
+
+      true
     end
 
     def update_order_after_trade(multi, order, traded_amount)
-      remaining = order['amount'].to_f - traded_amount
-      order_id = order['id']
-      side = order['side']
-
-      @logger.debug("Updating order #{order_id} - Traded: #{traded_amount}, Remaining: #{remaining}")
-
-      if remaining <= 0
-        # 订单完全成交
-        @logger.info("Order #{order_id} fully filled")
-        multi.del(order_key(order_id))
-        multi.zrem(price_key(side), order_id)
+      order_key = order_key(order['id'])
+      price_key = price_key(order['side'])
+      
+      remaining_amount = BigDecimal(order['amount']) - BigDecimal(traded_amount.to_s)
+      
+      if remaining_amount.zero?
+        # 订单完全成交，从价格队列中移除
+        multi.zrem(price_key, order['id'])
+        multi.hset(order_key, 'status', 'filled')
       else
-        # 部分成交
-        @logger.info("Order #{order_id} partially filled - Remaining: #{remaining}")
-        multi.hset(order_key(order_id), 'amount', remaining)
+        # 订单部分成交，更新剩余数量
+        multi.hset(order_key, 'amount', remaining_amount.to_s('F'))
       end
     end
 
     def get_orders_by_side(conn, side)
       price_key = price_key(side)
-      # 获取所有价格级别
-      prices = if side == 'buy'
-                conn.zrevrange(price_key, 0, -1, with_scores: true)
-              else
-                conn.zrange(price_key, 0, -1, with_scores: true)
-              end
-
-      orders = []
-      prices.each do |order_id, price|
-        order = conn.hgetall(order_key(order_id))
-        orders << order unless order.empty?
-      end
-      orders
+      order_ids = conn.zrange(price_key, 0, -1, with_scores: true)
+      
+      orders = order_ids.map do |id, price|
+        order = conn.hgetall(order_key(id))
+        next if order.empty?
+        order.merge('price' => price)
+      end.compact
+      
+      side == 'buy' ? orders.reverse : orders
     end
 
     def print_orders(orders)
-      if orders.empty?
-        @logger.info("  No orders")
-        return
-      end
-
-      # 按价格分组
-      orders_by_price = orders.group_by { |order| order['price'] }
-      
-      orders_by_price.each do |price, price_orders|
-        total_amount = price_orders.sum { |order| order['amount'].to_f }
-        @logger.info("  Price: #{price}")
-        @logger.info("    Total Amount: #{total_amount}")
-        @logger.info("    Orders:")
-        price_orders.each do |order|
-          @logger.info("      ID: #{order['id']}, Amount: #{order['amount']}, Time: #{Time.at(order['timestamp'].to_i)}")
-        end
+      orders.each do |order|
+        @logger.info("#{order['id']} - Price: #{order['price']}, Amount: #{order['amount']}")
       end
     end
 
@@ -303,7 +238,7 @@ module ExchangeEngine
     end
 
     def trades_key
-      "#{@symbol}:trades"
+      "trades:#{@symbol}"
     end
   end
 end

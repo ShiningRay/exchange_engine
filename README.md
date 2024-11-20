@@ -11,6 +11,7 @@ A high-performance trading system with Redis-backed order book management and a 
 - Price-time priority matching
 - Detailed logging and monitoring
 - Trade history queue
+- Asynchronous order processing
 
 ## Prerequisites
 
@@ -40,6 +41,79 @@ development:
     - ETHUSDT
   log_level: info
 ```
+
+## Redis Configuration
+
+### AOF (Append Only File) Mode
+
+For a trading system, data durability is crucial. We strongly recommend using Redis AOF mode to ensure no trades are lost in case of system crashes or power failures.
+
+1. Edit your `redis.conf`:
+```conf
+# Enable AOF
+appendonly yes
+
+# AOF fsync policy options:
+# - always: fsync after every write (safest, slowest)
+# - everysec: fsync every second (good compromise)
+# - no: let OS handle fsync (fastest, least safe)
+appendfsync everysec
+
+# Auto-rewrite AOF file when it gets too large
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# If you have enough memory, you can also enable RDB snapshots alongside AOF
+save 900 1
+save 300 10
+save 60 10000
+```
+
+2. Verify AOF is working:
+```bash
+redis-cli info persistence
+```
+
+Look for:
+```
+aof_enabled:1
+aof_rewrite_in_progress:0
+aof_last_rewrite_time_sec:-1
+aof_current_size:0
+aof_base_size:0
+```
+
+3. Monitor AOF status:
+```bash
+# Check AOF file size
+ls -lh /path/to/redis/appendonly.aof
+
+# Check AOF rewrite status
+redis-cli info persistence | grep aof_
+```
+
+4. Recovery process:
+```bash
+# If Redis fails to start due to corrupted AOF
+redis-check-aof --fix /path/to/redis/appendonly.aof
+```
+
+### Performance Considerations
+
+1. **fsync Policy**:
+   - `appendfsync always`: Maximum safety but slower performance
+   - `appendfsync everysec`: Good compromise (recommended)
+   - `appendfsync no`: Maximum performance but risk of data loss
+
+2. **AOF Rewrite**:
+   - Automatically triggered when AOF size grows by 100%
+   - Minimum size threshold: 64MB
+   - Adjust these values based on your system capacity
+
+3. **Combined Persistence**:
+   - Consider enabling both AOF and RDB for better recovery options
+   - RDB provides point-in-time snapshots
+   - AOF ensures command-by-command durability
 
 ## Usage
 

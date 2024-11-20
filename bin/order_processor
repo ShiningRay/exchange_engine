@@ -1,0 +1,116 @@
+#!/usr/bin/env ruby
+
+require_relative '../lib/order_book'
+require_relative '../lib/order_processor'
+require_relative '../lib/performance_monitor'
+require 'connection_pool'
+require 'redis'
+require 'logger'
+require 'optparse'
+require 'yaml'
+require 'erb'
+
+options = {
+  environment: 'development',
+  log_level: Logger::INFO,
+  config_file: File.expand_path('../config/config.yml', __dir__)
+}
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: order_processor [options]"
+
+  opts.on("-e", "--environment ENV", "Environment (development/test/production)") do |env|
+    options[:environment] = env
+  end
+
+  opts.on("-l", "--log-level LEVEL", "Log level (debug/info/warn/error)") do |level|
+    options[:log_level] = case level.downcase
+      when 'debug' then Logger::DEBUG
+      when 'info'  then Logger::INFO
+      when 'warn'  then Logger::WARN
+      when 'error' then Logger::ERROR
+      else Logger::INFO
+    end
+  end
+
+  opts.on("-c", "--config FILE", "Configuration file path") do |file|
+    options[:config_file] = file
+  end
+end.parse!
+
+begin
+  # 设置日志
+  logger = Logger.new(STDOUT)
+  logger.level = options[:log_level]
+
+  # 加载配置
+  config_content = ERB.new(File.read(options[:config_file])).result
+  config = YAML.load(config_content)[options[:environment]]
+  
+  unless config
+    raise "Configuration not found for environment: #{options[:environment]}"
+  end
+
+  # 初始化 Redis 连接池
+  redis_pool = ConnectionPool.new(size: config['redis_pool_size'] || 5) do 
+    Redis.new(url: config['redis_url'])
+  end
+
+  # 初始化性能监控
+  performance_monitor = ExchangeEngine::PerformanceMonitor.new(redis_pool)
+
+  # 初始化交易对
+  redis_pool.with do |conn|
+    logger.info("Initializing trading pairs: #{config['trading_pairs'].join(', ')}")
+    conn.del('trading_pairs')
+    config['trading_pairs'].each do |pair|
+      conn.sadd('trading_pairs', pair)
+    end
+  end
+
+  # 创建处理器管理器
+  processor_manager = ExchangeEngine::OrderProcessorManager.new(redis_pool, logger)
+
+  # 捕获信号以优雅退出
+  Signal.trap("INT") do
+    logger.info("Received INT signal, shutting down...")
+    processor_manager.stop
+    exit
+  end
+
+  Signal.trap("TERM") do
+    logger.info("Received TERM signal, shutting down...")
+    processor_manager.stop
+    exit
+  end
+
+  # 启动处理器
+  logger.info("Starting order processors...")
+  processor_manager.start
+
+  # 定期打印性能指标和状态
+  Thread.new do
+    while true
+      sleep 60
+      begin
+        metrics = performance_monitor.get_metrics
+        logger.info("Performance metrics:")
+        metrics.each do |key, value|
+          logger.info("  #{key}: #{value}")
+        end
+      rescue => e
+        logger.error("Error collecting metrics: #{e.message}")
+      end
+    end
+  end
+
+  # 保持主进程运行
+  loop do
+    sleep 1
+  end
+
+rescue => e
+  puts "Failed to start order processor: #{e.message}"
+  puts e.backtrace
+  exit 1
+end
